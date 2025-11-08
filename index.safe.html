@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Returns Sorter — Safe Build</title>
+  <meta name="theme-color" content="#111111">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>body{-webkit-tap-highlight-color:transparent}</style>
+</head>
+<body class="bg-white text-gray-900">
+  <div class="min-h-screen w-full">
+    <header class="sticky top-0 z-10 bg-white/90 backdrop-blur border-b">
+      <div class="max-w-screen-sm mx-auto px-3 py-2 flex items-center gap-3">
+        <div class="font-semibold">Returns Sorter — Safe Build</div>
+        <div class="ml-auto flex gap-2">
+          <button id="btn-scan" class="px-3 py-1 rounded-xl border shadow-sm">📷 Scan</button>
+          <button id="btn-export" class="px-3 py-1 rounded-xl border shadow-sm">⬇️ Export</button>
+          <button id="btn-clear" class="px-3 py-1 rounded-xl border shadow-sm text-red-600">🗑️ Clear</button>
+        </div>
+      </div>
+      <div id="scan-panel" class="max-w-screen-sm mx-auto px-3 pb-2 hidden">
+        <div class="rounded-2xl overflow-hidden border">
+          <video id="video" class="w-full max-h-[40vh] object-cover" playsinline></video>
+        </div>
+        <div class="text-xs text-gray-500 mt-1">Point at a UPC barcode</div>
+        <div id="scan-error" class="text-xs text-amber-700"></div>
+      </div>
+    </header>
+
+    <main class="max-w-screen-sm mx-auto px-3 py-3">
+      <div class="flex gap-2">
+        <input id="upc-input" placeholder="Enter UPC manually" inputmode="numeric"
+               class="flex-1 px-3 py-2 rounded-xl border">
+        <button id="btn-add" class="px-4 py-2 rounded-xl bg-black text-white">Add</button>
+      </div>
+
+      <div class="mt-3 grid grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border p-2 flex items-center justify-between">
+          <label>Number of totes</label>
+          <select id="num-totes" class="px-2 py-1 rounded-xl border">
+            <option>5</option><option>6</option><option>7</option><option selected>8</option>
+          </select>
+        </div>
+        <div class="rounded-xl border p-2 flex items-center justify-between">
+          <label>Tote capacity (units)</label>
+          <input id="tote-cap" type="number" min="5" max="200" value="20" class="px-2 py-1 rounded-xl border w-24">
+        </div>
+      </div>
+
+      <div id="tote-loads" class="mt-3 grid grid-cols-2 gap-2"></div>
+
+      <div id="items" class="mt-4 grid gap-3"></div>
+
+      <section class="mt-8">
+        <div class="text-lg font-semibold mb-2">Finish: Put-back route (grouped by aisle)</div>
+        <div id="grouped" class="grid gap-3"></div>
+      </section>
+      <div class="h-20"></div>
+    </main>
+
+    <nav class="fixed bottom-0 inset-x-0 bg-white border-t">
+      <div class="max-w-screen-sm mx-auto px-3 py-2 grid grid-cols-3 gap-2">
+        <button id="nav-scan" class="px-3 py-2 rounded-xl bg-black text-white">📷 Scan</button>
+        <button id="nav-top" class="px-3 py-2 rounded-xl border">⬆️ Top</button>
+        <button id="nav-reassign" class="px-3 py-2 rounded-xl border">🛠️ Reassign</button>
+      </div>
+    </nav>
+  </div>
+
+  <!-- ZXing UMD build -->
+  <script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+  <script>
+  (function(){
+    const q = s => document.querySelector(s);
+    const lcKey = k => 'wr_' + k;
+    const save = (k,v) => localStorage.setItem(lcKey(k), JSON.stringify(v));
+    const load = (k, d) => { try { return JSON.parse(localStorage.getItem(lcKey(k))||'null') ?? d; } catch { return d; } };
+    const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+
+    let items = load('batch', []);
+    let overrides = load('overrides', {});
+    let numTotes = clamp(Number(load('num_totes', 8))||8, 5, 8);
+    let toteCap = clamp(Number(load('tote_capacity', 20))||20, 5, 200);
+
+    // UI refs
+    const $scanPanel = q('#scan-panel');
+    const $video = q('#video');
+    const $scanErr = q('#scan-error');
+    const $btnScan = q('#btn-scan');
+    const $btnExport = q('#btn-export');
+    const $btnClear = q('#btn-clear');
+    const $btnAdd = q('#btn-add');
+    const $upcInput = q('#upc-input');
+    const $numTotes = q('#num-totes');
+    const $toteCap = q('#tote-cap');
+    const $toteLoads = q('#tote-loads');
+    const $items = q('#items');
+    const $grouped = q('#grouped');
+    const $navScan = q('#nav-scan');
+    const $navTop = q('#nav-top');
+    const $navReassign = q('#nav-reassign');
+
+    // init settings
+    $numTotes.value = String(numTotes);
+    $toteCap.value = String(toteCap);
+
+    $numTotes.addEventListener('change', () => {
+      numTotes = clamp(Number($numTotes.value)||8, 5, 8);
+      save('num_totes', numTotes);
+      render();
+    });
+    $toteCap.addEventListener('change', () => {
+      toteCap = clamp(Number($toteCap.value)||20, 5, 200);
+      save('tote_capacity', toteCap);
+      render();
+    });
+
+    function humanUPC(upc){
+      return upc.replace(/\\D/g,'').replace(/(\\d{1,6})(\\d{5})(\\d)/, '$1 $2 $3');
+    }
+
+    function guessAisleBuckets(aisles){
+      const sorted = [...new Set((aisles||[]).filter(Boolean).map(a => String(a).toUpperCase()))]
+        .sort((a,b) => a.localeCompare(b, undefined, { numeric:true }));
+      const buckets = new Map();
+      sorted.forEach((aisle, idx) => {
+        const bucket = Math.floor((idx / Math.max(1, sorted.length)) * numTotes);
+        buckets.set(aisle, Math.min(numTotes - 1, bucket));
+      });
+      return buckets;
+    }
+    function toteForAisle(aisle){
+      if (!aisle) return 1;
+      const map = guessAisleBuckets(items.map(i => i.aisle));
+      const idx = map.get(String(aisle).toUpperCase());
+      return ((idx ?? 0) + 1);
+    }
+    function loads(local = items){
+      const a = new Array(numTotes).fill(0);
+      for (const it of local) if (it.tote>=1 && it.tote<=numTotes) a[it.tote-1] += (it.size||1);
+      return a;
+    }
+    function findToteWithSpace(preferred, sizeUnits, local = items){
+      const L = loads(local);
+      for (let off=0; off<numTotes; off++){
+        const t = ((preferred-1+off)%numTotes)+1;
+        if ((L[t-1] + sizeUnits) <= toteCap) return t;
+      }
+      return null;
+    }
+    function assignTote(it){
+      const size = it.size || 1;
+      const pref = toteForAisle(it.aisle);
+      const t = findToteWithSpace(pref, size);
+      return t ?? 0;
+    }
+    function reassignAll(){
+      const sorted = [...items].sort((a,b)=>(b.size||1)-(a.size||1));
+      const next = [];
+      for (const it of sorted){
+        const t = findToteWithSpace(toteForAisle(it.aisle), it.size||1, next);
+        next.push({...it, tote: t ?? 0});
+      }
+      // restore original order
+      items = items.map(it => next.find(n => n.id===it.id) || it);
+      save('batch', items);
+      render();
+    }
+
+    function addItemFromUPC(upc){
+      const clean = upc.replace(/\\D/g,'');
+      if (!clean) return;
+      const ov = overrides[clean] || {};
+      const base = {
+        upc: clean,
+        title: ov.title || ('UPC ' + humanUPC(clean)),
+        image: ov.image || null,
+        aisle: ov.aisle || null,
+        size: ov.size || 1
+      };
+      const newItem = { id: crypto.randomUUID(), done:false, tote:0, ...base };
+      newItem.tote = assignTote(newItem);
+      items = [newItem, ...items];
+      save('batch', items);
+      render();
+    }
+
+    function removeItem(id){
+      items = items.filter(i => i.id !== id);
+      save('batch', items);
+      render();
+    }
+    function updateItem(id, patch){
+      items = items.map(i => i.id===id ? {...i, ...patch} : i);
+      save('batch', items);
+      render();
+    }
+
+    function exportCSV(){
+      const headers = ["UPC","Title","Aisle","Tote","SizeUnits","Done"];
+      const rows = items.map(i => [i.upc, i.title, i.aisle||"", i.tote, i.size||1, i.done?"yes":"no"]);
+      const csv = [headers.join(","), ...rows.map(r => r.map(x => `"${String(x??"").replace(/"/g,'""')}"`).join(","))].join("\\n");
+      const blob = new Blob([csv], { type:"text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href=url; a.download='returns_'+Date.now()+'.csv'; a.click(); URL.revokeObjectURL(url);
+    }
+
+    function renderLoads(){
+      const L = loads();
+      $toteLoads.innerHTML = '';
+      for (let t=1; t<=numTotes; t++){
+        const used = L[t-1] || 0;
+        const full = used >= toteCap;
+        const el = document.createElement('div');
+        el.className = 'rounded-xl border p-2 text-sm flex items-center justify-between';
+        el.innerHTML = `<div class="font-medium">Tote ${t}</div><span class="px-2 py-0.5 rounded-full border ${full?'bg-red-50 border-red-300 text-red-700':'bg-gray-100'}">Load ${used}/${toteCap}${full?' (Full)':''}</span>`;
+        $toteLoads.appendChild(el);
+      }
+    }
+
+    function renderList(){
+      $items.innerHTML = '';
+      for (const it of items){
+        const card = document.createElement('div');
+        card.className = 'rounded-2xl border shadow-sm p-3 flex gap-3 ' + (it.tote===0?'border-amber-300 bg-amber-50':'');
+        card.innerHTML = `
+          <div class="w-16 h-16 bg-gray-100 rounded-xl overflow-hidden flex items-center justify-center">🧩</div>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium truncate">${it.title}</div>
+            <div class="text-xs text-gray-500">UPC ${humanUPC(it.upc)}</div>
+            <div class="mt-1 flex flex-wrap items-center gap-2 text-sm">
+              <span class="px-2 py-0.5 rounded-full bg-gray-100 border">Aisle: <span class="aisle-val">${it.aisle||'—'}</span></span>
+              <span class="px-2 py-0.5 rounded-full border ${it.tote===0?'bg-amber-100 border-amber-300':'bg-gray-100'}">Tote: ${it.tote||'— (unassigned)'}</span>
+            </div>
+            <div class="mt-2 flex items-center gap-2">
+              <button class="px-3 py-1 rounded-xl border ${it.done?'bg-green-50 border-green-300':''}">${it.done?'Completed':'Complete'}</button>
+              <select class="px-2 py-1 rounded-xl border size">
+                <option value="1" ${it.size==1?'selected':''}>Size: S (1)</option>
+                <option value="2" ${it.size==2?'selected':''}>M (2)</option>
+                <option value="3" ${it.size==3?'selected':''}>L (3)</option>
+                <option value="5" ${it.size==5?'selected':''}>XL (5)</option>
+              </select>
+              <select class="px-2 py-1 rounded-xl border tote">
+                <option value="0" ${it.tote==0?'selected':''}>Set tote…</option>
+                ${Array.from({length:numTotes},(_,i)=>i+1).map(t=>`<option value="${t}" ${it.tote==t?'selected':''}>Tote ${t}</option>`).join('')}
+              </select>
+              <button class="px-3 py-1 rounded-xl border reassign">Reassign</button>
+            </div>
+          </div>
+          <div class="w-28 shrink-0 flex flex-col gap-1 text-xs">
+            <label class="text-[10px] text-gray-500">Update aisle</label>
+            <input class="px-2 py-1 rounded-xl border aisle" placeholder="e.g. A15" value="${it.aisle||''}">
+            <label class="text-[10px] text-gray-500 mt-1">Override title</label>
+            <input class="px-2 py-1 rounded-xl border title" value="${it.title}">
+            <button class="mt-2 px-2 py-1 rounded-xl border remove">Remove</button>
+          </div>
+        `;
+        // hooks
+        card.querySelector('.remove').onclick = () => removeItem(it.id);
+        card.querySelector('button').onclick = () => updateItem(it.id, { done: !it.done });
+        card.querySelector('.size').onchange = (e) => {
+          const size = Number(e.target.value)||1;
+          const next = items.filter(x=>x.id!==it.id);
+          const t = findToteWithSpace(toteForAisle(it.aisle), size, next);
+          updateItem(it.id, { size, tote: t ?? 0 });
+          overrides[it.upc] = { ...(overrides[it.upc]||{}), size };
+          save('overrides', overrides);
+        };
+        card.querySelector('.tote').onchange = (e) => updateItem(it.id, { tote: Number(e.target.value)||0 });
+        card.querySelector('.reassign').onclick = () => {
+          const t = findToteWithSpace(toteForAisle(it.aisle), it.size||1, items.filter(x=>x.id!==it.id));
+          updateItem(it.id, { tote: t ?? 0 });
+        };
+        card.querySelector('.aisle').onblur = (e) => {
+          const aisle = (e.target.value||'').trim().toUpperCase() || null;
+          const next = items.filter(x=>x.id!==it.id);
+          const t = findToteWithSpace(toteForAisle(aisle), it.size||1, next);
+          updateItem(it.id, { aisle, tote: t ?? 0 });
+          if (aisle){
+            overrides[it.upc] = { ...(overrides[it.upc]||{}), aisle };
+            save('overrides', overrides);
+          }
+        };
+        card.querySelector('.title').onblur = (e) => {
+          const title = e.target.value.trim() || it.title;
+          updateItem(it.id, { title });
+          overrides[it.upc] = { ...(overrides[it.upc]||{}), title };
+          save('overrides', overrides);
+        };
+        $items.appendChild(card);
+      }
+    }
+
+    function renderGrouped(){
+      const by = new Map();
+      for (const it of items){
+        const key = it.aisle || '?';
+        if (!by.has(key)) by.set(key, []);
+        by.get(key).push(it);
+      }
+      const entries = [...by.entries()].sort((A,B)=>A[0].localeCompare(B[0], undefined, { numeric:true }));
+      $grouped.innerHTML = '';
+      for (const [aisle, list] of entries){
+        const box = document.createElement('div');
+        box.className = 'rounded-2xl border p-3';
+        box.innerHTML = `
+          <div class="flex items-center justify-between">
+            <div class="font-medium">Aisle ${aisle}</div>
+            <div class="text-xs text-gray-500">Suggested Tote ${toteForAisle(aisle)}</div>
+          </div>
+          <div class="mt-2 grid gap-2">
+            ${list.map(it => `<label class="flex items-center gap-2"><input type="checkbox" ${it.done?'checked':''} data-id="${it.id}"><span class="truncate text-sm">${it.title}</span></label>`).join('')}
+          </div>
+        `;
+        box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+          cb.onchange = () => updateItem(cb.dataset.id, { done: cb.checked });
+        });
+        $grouped.appendChild(box);
+      }
+    }
+
+    function render(){
+      renderLoads();
+      renderList();
+      renderGrouped();
+    }
+
+    // scanning
+    let reader = null;
+    async function startScan(){
+      if (!window.ZXing || !ZXing.BrowserMultiFormatReader){
+        $scanErr.textContent = 'Scanner library failed to load.';
+        return;
+      }
+      try {
+        reader = new ZXing.BrowserMultiFormatReader();
+        const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+        const back = (devices.find(d => /back|rear/i.test(d.label)) || devices[0] || {}).deviceId;
+        await reader.decodeFromVideoDevice(back, $video, (res, err) => {
+          if (res) {
+            addItemFromUPC(res.getText());
+            stopScan();
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+        });
+        $scanErr.textContent = '';
+        $scanPanel.classList.remove('hidden');
+      } catch (e){
+        $scanErr.textContent = String(e);
+      }
+    }
+    function stopScan(){
+      try { reader && reader.reset(); } catch {}
+      $scanPanel.classList.add('hidden');
+    }
+
+    // events
+    $btnScan.onclick = startScan;
+    $navScan.onclick = startScan;
+    $navTop.onclick = () => window.scrollTo({ top: 0, behavior: 'smooth' });
+    $btnExport.onclick = exportCSV;
+    $btnClear.onclick = () => { if (confirm('Clear current batch?')) { items = []; save('batch', items); render(); } };
+    $btnAdd.onclick = () => { const v = $upcInput.value.trim(); if (v){ $upcInput.value=''; addItemFromUPC(v); } };
+    $navReassign.onclick = reassignAll;
+
+    render();
+  })();
+  </script>
+</body>
+</html>
