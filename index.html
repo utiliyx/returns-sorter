@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Returns Sorter — Walmart #4554</title>
+    <meta name="theme-color" content="#111111" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body { -webkit-tap-highlight-color: transparent; }
+      input, button, select { font: inherit; }
+      dialog::backdrop { background: rgba(0,0,0,0.3); }
+    </style>
+  </head>
+  <body class="bg-white text-gray-900">
+    <div id="root"></div>
+    <script type="module">
+      import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18";
+      import { createRoot } from "https://esm.sh/react-dom@18/client";
+      import { motion } from "https://esm.sh/framer-motion@11";
+      import { BrowserMultiFormatReader } from "https://esm.sh/@zxing/library@0.20.0";
+      import * as Lucide from "https://esm.sh/lucide-react@0.460.0";
+      const { Camera, CheckCircle2, ClipboardList, Download, Package2, QrCode, RefreshCw, Scan, Settings, ShoppingBasket, Trash2, SlidersHorizontal, Wrench } = Lucide;
+
+      // ===== CONFIG =====
+      const STORE_ID = 4554;
+      const CLOUD_WORKER_BASE = ""; // optional e.g. "https://your-worker.workers.dev"
+      const BARCODELOOKUP_API_KEY = ""; // optional (images/titles fallback)
+
+      const USE_WORKER_FOR_MAP = true;
+      const USE_WORKER_FOR_WALMART_LOOKUP = true;
+
+      // ===== helpers =====
+      function estimateSizeUnits(info){
+        // info: { dims?:{L,W,H}, weight?:{value}, title?:string }
+        let vUnits = 0;
+        if(info?.dims && Number.isFinite(info.dims.L) && Number.isFinite(info.dims.W) && Number.isFinite(info.dims.H)){
+          const vol = info.dims.L * info.dims.W * info.dims.H; // cubic inches
+          if (vol <= 100) vUnits = 1;       // small deodorant, candy
+          else if (vol <= 300) vUnits = 2;  // shampoo, cereal box, light items
+          else if (vol <= 700) vUnits = 3;  // bigger boxes, small appliances
+          else vUnits = 5;                  // bulky items
+        }
+        let wUnits = 0;
+        if(info?.weight && Number.isFinite(info.weight.value)){
+          const lb = info.weight.value;
+          if (lb <= 1) wUnits = 1;
+          else if (lb <= 3) wUnits = 2;
+          else if (lb <= 8) wUnits = 3;
+          else wUnits = 5;
+        }
+        // Title heuristics
+        const t = (info?.title || "").toLowerCase();
+        let tUnits = 0;
+        if (/travel|mini|trial/.test(t)) tUnits = 1;
+        if (/(gallon|1\s*gal|5\s*qt|family size|party size)/.test(t)) tUnits = Math.max(tUnits, 5);
+        if (/(12-pack|24-pack|case)/.test(t)) tUnits = Math.max(tUnits, 3);
+
+        const est = Math.max(vUnits, wUnits, tUnits, 1);
+        return est;
+      }
+      const lcKey = (k) => `wr_${k}`;
+      const saveJSON = (k, v) => localStorage.setItem(lcKey(k), JSON.stringify(v));
+      const loadJSON = (k, d) => { try { const v = JSON.parse(localStorage.getItem(lcKey(k)) || "null"); return v ?? d; } catch { return d; } };
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      function humanUPC(upc) { return upc.replace(/\\D/g, "").replace(/(\\d{1,6})(\\d{5})(\\d)/, "$1 $2 $3"); }
+      function guessAisleBuckets(aisles, coords, numTotes) {
+        const sorted = [...new Set((aisles||[]).filter(Boolean).map(x=>String(x).toUpperCase()))];
+        if (coords && coords.size) {
+          sorted.sort((a,b) => {
+            const A = coords.get(a) || {x:Infinity, y:Infinity};
+            const B = coords.get(b) || {x:Infinity, y:Infinity};
+            return A.x === B.x ? (A.y - B.y) : (A.x - B.x);
+          });
+        } else {
+          sorted.sort((a,b) => a.localeCompare(b, undefined, { numeric:true }));
+        }
+        const buckets = new Map();
+        sorted.forEach((aisle, idx) => {
+          const bucket = Math.floor((idx / Math.max(1, sorted.length)) * numTotes);
+          buckets.set(aisle, Math.min(numTotes - 1, bucket));
+        });
+        return buckets;
+      }
+      function computeToteLoad(items, numTotes) {
+        const load = new Array(numTotes).fill(0);
+        for (const it of items) {
+          if (it.tote && it.tote >= 1 && it.tote <= numTotes) {
+            load[it.tote - 1] += (it.size || 1);
+          }
+        }
+        return load;
+      }
+
+      // ===== data providers =====
+      async function fetchStoreMapCF(storeId) {
+        if (!CLOUD_WORKER_BASE || !USE_WORKER_FOR_MAP) return null;
+        try {
+          const res = await fetch(`${CLOUD_WORKER_BASE}/api/store-map?storeId=${storeId}`);
+          if (!res.ok) throw new Error(`map ${res.status}`);
+          const json = await res.json();
+          const m = new Map();
+          for (const a of json.aisles || []) m.set(String(a.code).toUpperCase(), { x: Number(a.x)||0, y: Number(a.y)||0 });
+          return m;
+        } catch (e) { console.warn("map fetch failed", e); return null; }
+      }
+      async function barcodeLookup(upc) {
+        if (!BARCODELOOKUP_API_KEY) return null;
+        try {
+          const res = await fetch(`https://api.barcodelookup.com/v3/products?barcode=${encodeURIComponent(upc)}&formatted=y&key=${BARCODELOOKUP_API_KEY}`);
+          if (!res.ok) throw new Error(`barcode ${res.status}`);
+          const j = await res.json();
+          const p = (j.products && j.products[0]) || null;
+          if (!p) return null;
+          return { upc, title: p.product_name || p.title || "Unknown item", image: (p.images && p.images[0]) || null, aisle: null };
+        } catch (e) { console.warn("barcodeLookup failed", e); return null; }
+      }
+      async function walmartByUPC(upc) {
+        if (!CLOUD_WORKER_BASE || !USE_WORKER_FOR_WALMART_LOOKUP) return null;
+        try {
+          const res = await fetch(`${CLOUD_WORKER_BASE}/api/walmart-by-upc?upc=${encodeURIComponent(upc)}&storeId=${STORE_ID}`);
+          if (!res.ok) throw new Error(`walmart ${res.status}`);
+          const j = await res.json();
+          return { upc, title: j.title || "Unknown item", image: j.image || null, aisle: j.aisle || null, section: j.section || null };
+        } catch (e) { console.warn("walmartByUPC failed", e); return null; }
+      }
+      async function lookupItem(upc) {
+        const clean = upc.replace(/\\D/g, "");
+        if (!clean) throw new Error("Invalid UPC");
+        const overrides = loadJSON("overrides", {});
+        if (overrides[clean]) {
+          const o = overrides[clean];
+          return { upc: clean, title: o.title || "Saved Item", image: o.image || null, aisle: o.aisle || null };
+        }
+        const w = await walmartByUPC(clean); if (w) return w;
+        const b = await barcodeLookup(clean); if (b) return b;
+        return { upc: clean, title: `UPC ${humanUPC(clean)}`, image: null, aisle: null };
+      }
+
+      function useStoreMap() {
+        const [coords, setCoords] = useState(null);
+        useEffect(() => {
+          let active = true;
+          (async () => {
+            const m = await fetchStoreMapCF(STORE_ID);
+            if (!active) return;
+            if (m) setCoords(m);
+          })();
+          return () => { active = false; };
+        }, []);
+        return coords;
+      }
+      function useZXingScanner(enabled) {
+        const videoRef = useRef(null);
+        const [lastError, setLastError] = useState(null);
+        const [reader, setReader] = useState(null);
+        useEffect(() => { const r = new BrowserMultiFormatReader(); setReader(r); return () => { try { r.reset(); } catch {} }; }, []);
+        useEffect(() => {
+          let cancel = false;
+          (async () => {
+            if (!reader || !enabled) return;
+            try {
+              const video = videoRef.current;
+              const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+              const backCam = devices.find(d => /back|rear/i.test(d.label))?.deviceId || devices[0]?.deviceId;
+              await reader.decodeFromVideoDevice(backCam, video, (res, err) => {
+                if (cancel) return;
+                if (res) window.dispatchEvent(new CustomEvent("zxing:code", { detail: res.getText() }));
+                if (err && !(err?.name === "NotFoundException")) setLastError(String(err));
+              });
+            } catch (e) { setLastError(String(e)); }
+          })();
+          return () => { cancel = true; try { reader?.reset(); } catch {} };
+        }, [reader, enabled]);
+        return { videoRef, lastError };
+      }
+
+      function App() {
+        const [scanning, setScanning] = useState(false);
+        const [items, setItems] = useState(loadJSON("batch", [])); // {id, upc, title, image, aisle, section, tote, size, done}
+        const [overrides, setOverrides] = useState(loadJSON("overrides", {}));
+        const [query, setQuery] = useState("");
+        const [busy, setBusy] = useState(false);
+        const [error, setError] = useState("");
+
+        // Settings
+        const [numTotes, setNumTotes] = useState(clamp(Number(loadJSON("num_totes", 8)) || 8, 5, 8));
+        const [toteCapacity, setToteCapacity] = useState(clamp(Number(loadJSON("tote_capacity", 20)) || 20, 5, 200));
+        const [settingsOpen, setSettingsOpen] = useState(false);
+
+        const coords = useStoreMap();
+
+        useEffect(() => saveJSON("batch", items), [items]);
+        useEffect(() => saveJSON("overrides", overrides), [overrides]);
+        useEffect(() => saveJSON("num_totes", numTotes), [numTotes]);
+        useEffect(() => saveJSON("tote_capacity", toteCapacity), [toteCapacity]);
+
+        const aisleBuckets = useMemo(() => {
+          const aisles = items.map(i => i.aisle).filter(Boolean);
+          return guessAisleBuckets(aisles, coords, numTotes);
+        }, [items, coords, numTotes]);
+
+        function toteForAisle(aisle) {
+          if (!aisle) return 1;
+          const idx = aisleBuckets.get(String(aisle).toUpperCase());
+          return ((idx ?? 0) + 1);
+        }
+        function getLoads(localItems = items) { return computeToteLoad(localItems, numTotes); }
+        function findToteWithSpace(preferred, sizeUnits, localItems = items) {
+          const loads = computeToteLoad(localItems, numTotes);
+          for (let offset = 0; offset < numTotes; offset++) {
+            const t = ((preferred - 1 + offset) % numTotes) + 1;
+            if (loads[t - 1] + sizeUnits <= toteCapacity) return t;
+          }
+          return null;
+        }
+        function assignTote(baseItem) {
+          const size = baseItem.size || 1;
+          const pref = toteForAisle(baseItem.aisle);
+          const t = findToteWithSpace(pref, size);
+          return t ?? 0; // 0 = unassigned
+        }
+        function reassignAll() {
+          const sorted = [...items].sort((a,b)=>(b.size||1)-(a.size||1));
+          const next = [];
+          for (const it of sorted) {
+            const candidate = { ...it, tote: 0 };
+            const t = findToteWithSpace(toteForAisle(it.aisle), it.size || 1, next);
+            candidate.tote = t ?? 0;
+            next.push(candidate);
+          }
+          const mapped = items.map(it => {
+            const rep = next.find(n => n.id === it.id) || it;
+            return { ...it, tote: rep.tote };
+          });
+          setItems(mapped);
+        }
+
+        async function handleScan(upc) {
+          setBusy(true); setError("");
+          try {
+            const base = await lookupItem(upc);
+            const ovSizeSaved = (loadJSON("overrides", {})||{})[base.upc]?.size;
+            const estUnits = (base.dims || base.weight) ? estimateSizeUnits({ dims: base.dims, weight: base.weight, title: base.title }) : 1;
+            const ovSize = ovSizeSaved || estUnits || 1; const newItem = { id: crypto.randomUUID(), done: false, size: ovSize, tote: 0, ...base };
+            newItem.tote = assignTote(newItem);
+            setItems(prev => [newItem, ...prev]);
+          } catch (e) { setError(String(e)); }
+          finally { setBusy(false); }
+        }
+
+        useEffect(() => {
+          function onCode(ev) { handleScan(ev.detail); setScanning(false); }
+          window.addEventListener("zxing:code", onCode);
+          return () => window.removeEventListener("zxing:code", onCode);
+        }, []);
+
+        const { videoRef, lastError } = useZXingScanner(scanning);
+
+        function updateItem(id, patch) {
+          setItems(prev => prev.map(i => i.id === id ? { ...i, ...patch } : i));
+        }
+        function removeItem(id) { setItems(prev => prev.filter(i => i.id !== id)); }
+        function clearBatch() { if (confirm("Clear current batch?")) setItems([]); }
+
+        function exportCSV() {
+          const headers = ["UPC","Title","Aisle","Tote","SizeUnits","Done"];
+          const rows = items.map(i => [i.upc, i.title.replace(/\\"/g,'\"'), i.aisle||"", i.tote, i.size||1, i.done?"yes":"no"]);
+          const csv = [headers.join(","), ...rows.map(r => r.map(x => `\"${(x??\"\").toString().replace(/\"/g,'\"')}\"`).join(","))].join("\\n");
+          const blob = new Blob([csv], { type: "text/csv" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = `returns_${Date.now()}.csv`; a.click();
+          URL.revokeObjectURL(url);
+        }
+
+        const grouped = useMemo(() => {
+          const byAisle = new Map();
+          for (const it of items) {
+            const key = it.aisle || "?";
+            if (!byAisle.has(key)) byAisle.set(key, []);
+            byAisle.get(key).push(it);
+          }
+          const entries = [...byAisle.entries()];
+          const sortAlpha = (a,b) => a.localeCompare(b, undefined, { numeric:true });
+          if (coords && coords.size) entries.sort((A,B) => {
+            const [a] = A, [b] = B; const ca = coords.get(String(a).toUpperCase()), cb = coords.get(String(b).toUpperCase());
+            if (!ca && !cb) return sortAlpha(a,b);
+            if (!ca) return 1; if (!cb) return -1;
+            return ca.x === cb.x ? (ca.y - cb.y) : (ca.x - cb.x);
+          }); else entries.sort((A,B) => sortAlpha(A[0], B[0]));
+          return entries;
+        }, [items, coords]);
+
+        const loads = getLoads();
+        function loadBadge(tote) {
+          const idx = tote - 1;
+          const used = loads[idx] || 0;
+          const full = used >= toteCapacity;
+          return React.createElement("span", { className: `px-2 py-0.5 rounded-full border ${full?"bg-red-50 border-red-300 text-red-700":"bg-gray-100"}` },
+            `Load ${used}/${toteCapacity}${full?" (Full)":""}`
+          );
+        }
+
+        return (
+          React.createElement("div", { className: "min-h-screen w-full bg-white text-gray-900" },
+            React.createElement("header", { className:"sticky top-0 z-10 bg-white/90 backdrop-blur border-b" },
+              React.createElement("div", { className:"max-w-screen-sm mx-auto px-3 py-2 flex items-center gap-3" },
+                React.createElement(ShoppingBasket, { className:"w-6 h-6" }),
+                React.createElement("div", { className:"font-semibold" }, `Returns Sorter — Store #${STORE_ID}`),
+                React.createElement("div", { className:"ml-auto flex gap-2 items-center" },
+                  React.createElement("button", { onClick: ()=>setSettingsOpen(true), className:"px-3 py-1 rounded-xl border shadow-sm flex items-center gap-2" },
+                    React.createElement(SlidersHorizontal, { className:"w-4 h-4" }), "Settings"
+                  ),
+                  React.createElement("button", { onClick: () => setScanning(s=>!s), className:"px-3 py-1 rounded-xl border shadow-sm flex items-center gap-2" },
+                    React.createElement(Camera, { className:"w-4 h-4" }), scanning ? "Stop" : "Scan"
+                  ),
+                  React.createElement("button", { onClick: exportCSV, className:"px-3 py-1 rounded-xl border shadow-sm flex items-center gap-2" },
+                    React.createElement(Download, { className:"w-4 h-4" }), "Export"
+                  ),
+                  React.createElement("button", { onClick: clearBatch, className:"px-3 py-1 rounded-xl border shadow-sm flex items-center gap-2 text-red-600" },
+                    React.createElement(Trash2, { className:"w-4 h-4" }), "Clear"
+                  ),
+                )
+              ),
+              scanning && React.createElement("div", { className:"max-w-screen-sm mx-auto px-3 pb-2" },
+                React.createElement("div", { className:"rounded-2xl overflow-hidden border" },
+                  React.createElement("video", { ref: videoRef, className:"w-full max-h-[40vh] object-cover", playsInline:true })
+                ),
+                React.createElement("div", { className:"text-xs text-gray-500 mt-1 flex items-center gap-2" },
+                  React.createElement(Scan, { className:"w-3 h-3" }), "Point at a UPC barcode"),
+                lastError && React.createElement("div", { className:"text-xs text-amber-700" }, String(lastError))
+              )
+            ),
+
+            React.createElement("main", { className:"max-w-screen-sm mx-auto px-3 py-3" },
+              React.createElement("div", { className:"flex gap-2" },
+                React.createElement("input", { value:query, onChange:e=>setQuery(e.target.value), placeholder:"Enter UPC manually", inputMode:"numeric", className:"flex-1 px-3 py-2 rounded-xl border" }),
+                React.createElement("button", { disabled:!query||busy, onClick:()=>{ const u=query; setQuery(""); handleScan(u); }, className:"px-4 py-2 rounded-xl bg-black text-white disabled:opacity-40" }, "Add")
+              ),
+              React.createElement("div", { className:"mt-3 text-sm text-gray-600 flex items-start gap-2" },
+                React.createElement(ClipboardList, { className:"w-4 h-4 mt-0.5" }),
+                React.createElement("div", null, "Tip: If aisle is unknown, tap it and type the value from Walmart Store Mode. The app remembers it next time.")
+              ),
+
+              React.createElement("div", { className:"mt-3 grid grid-cols-2 gap-2" },
+                Array.from({ length: numTotes }, (_, i) => i+1).map(t =>
+                  React.createElement("div", { key:t, className:"rounded-xl border p-2 text-sm flex items-center justify-between" },
+                    React.createElement("div", { className:"font-medium" }, `Tote ${t}`),
+                    loadBadge(t)
+                  )
+                )
+              ),
+
+              React.createElement("div", { className:"mt-4 grid gap-3" },
+                items.map((it) => (
+                  React.createElement(motion.div, { key: it.id, layout:true, initial:{opacity:0, y:10}, animate:{opacity:1, y:0}, className:`rounded-2xl border shadow-sm p-3 flex gap-3 ${it.tote===0?"border-amber-300 bg-amber-50":""}` },
+                    React.createElement("div", { className:"w-16 h-16 bg-gray-100 rounded-xl overflow-hidden flex items-center justify-center" },
+                      it.image ? React.createElement("img", { src: it.image, alt:"", className:"w-full h-full object-cover" }) : React.createElement(Package2, { className:"w-6 h-6 text-gray-400" })
+                    ),
+                    React.createElement("div", { className:"flex-1 min-w-0" },
+                      React.createElement("div", { className:"text-sm font-medium truncate" }, it.title),
+                      React.createElement("div", { className:"text-xs text-gray-500" }, "UPC ", humanUPC(it.upc)),
+                      React.createElement("div", { className:"mt-1 flex flex-wrap items-center gap-2 text-sm" },
+                        React.createElement("span", { className:"px-2 py-0.5 rounded-full bg-gray-100 border" }, "Aisle: ", it.aisle || "—"),
+                        React.createElement("span", { className:`px-2 py-0.5 rounded-full border ${it.tote===0?"bg-amber-100 border-amber-300":"bg-gray-100"}` }, "Tote: ", it.tote===0?"— (unassigned)":it.tote),
+                        it.section && React.createElement("span", { className:"px-2 py-0.5 rounded-full bg-gray-100 border" }, "Section: ", it.section)
+                      ),
+                      React.createElement("div", { className:"mt-2 flex items-center gap-2" },
+                        React.createElement("button", { className:`px-3 py-1 rounded-xl border ${it.done?"bg-green-50 border-green-300":""}`, onClick:()=>updateItem(it.id, { done: !it.done }) },
+                          React.createElement("div", { className:"flex items-center gap-2" },
+                            React.createElement(CheckCircle2, { className:"w-4 h-4" }), it.done?"Completed":"Complete"
+                          )
+                        ),
+                        React.createElement("select", {
+                          className:"px-2 py-1 rounded-xl border",
+                          value: it.size || 1,
+                          onChange:(e)=>{
+                            const size = Number(e.target.value)||1;
+                            const patched = { ...it, size };
+                            // persist size override
+                            const ov1 = { ...(loadJSON("overrides", {})||{}) }; ov1[it.upc] = { ...(ov1[it.upc]||{}), size }; saveJSON("overrides", ov1);
+                            const t = findToteWithSpace(toteForAisle(patched.aisle), size, items.filter(x=>x.id!==it.id));
+                            patched.tote = t ?? 0;
+                            updateItem(it.id, patched);
+                          }
+                        },
+                          React.createElement("option", { value:1 }, "Size: S (1)"),
+                          React.createElement("option", { value:2 }, "M (2)"),
+                          React.createElement("option", { value:3 }, "L (3)"),
+                          React.createElement("option", { value:5 }, "XL (5)")
+                        ),
+                        React.createElement("select", {
+                          className:"px-2 py-1 rounded-xl border",
+                          value: it.tote || 0,
+                          onChange:(e)=> updateItem(it.id, { tote: Number(e.target.value)||0 })
+                        },
+                          React.createElement("option", { value:0 }, "Set tote…"),
+                          Array.from({ length: numTotes }, (_, i)=>i+1).map(t =>
+                            React.createElement("option", { key:t, value:t }, `Tote ${t}`)
+                          )
+                        ),
+                        React.createElement("button", {
+                          className:"px-3 py-1 rounded-xl border",
+                          onClick:()=>{
+                            const t = findToteWithSpace(toteForAisle(it.aisle), it.size || 1, items.filter(x=>x.id!==it.id));
+                            updateItem(it.id, { tote: t ?? 0 });
+                          }
+                        }, "Reassign")
+                      )
+                    ),
+                    React.createElement("div", { className:"w-28 shrink-0 flex flex-col gap-1 text-xs" },
+                      React.createElement("label", { className:"text-[10px] text-gray-500" }, "Update aisle"),
+                      React.createElement("input", {
+                        defaultValue: it.aisle || "",
+                        placeholder: "e.g. A15",
+                        className:"px-2 py-1 rounded-xl border",
+                        onBlur:(e)=>{
+                          const aisle = (e.target.value || "").trim().toUpperCase() || null;
+                          const size = it.size || 1;
+                          const fallback = toteForAisle(aisle);
+                          const t = findToteWithSpace(fallback, size, items.filter(x=>x.id!==it.id));
+                          updateItem(it.id, { aisle, tote: t ?? 0 });
+                          if (aisle) {
+                            const next = { ...(loadJSON("overrides", {}) || {}) };
+                            next[it.upc] = { ...(next[it.upc]||{}), aisle };
+                            saveJSON("overrides", next);
+                            setOverrides(next);
+                          }
+                        }
+                      }),
+                      React.createElement("label", { className:"text-[10px] text-gray-500 mt-1" }, "Override title"),
+                      React.createElement("input", {
+                        defaultValue: it.title,
+                        className:"px-2 py-1 rounded-xl border",
+                        onBlur:(e)=>{
+                          const title = e.target.value.trim() || it.title;
+                          updateItem(it.id, { title });
+                          const next = { ...(loadJSON("overrides", {}) || {}) };
+                          next[it.upc] = { ...(next[it.upc]||{}), title };
+                          saveJSON("overrides", next);
+                          setOverrides(next);
+                        }
+                      })
+                    )
+                  )
+                ))
+              ),
+
+              React.createElement("div", { className:"mt-8" },
+                React.createElement("div", { className:"text-lg font-semibold mb-2 flex items-center gap-2" },
+                  React.createElement(Settings, { className:"w-5 h-5" }), "Finish: Put-back route (grouped by aisle)"
+                ),
+                grouped.length === 0 && React.createElement("div", { className:"text-sm text-gray-500" }, "No items yet. Scan something to get started."),
+                React.createElement("div", { className:"grid gap-3" },
+                  grouped.map(([aisle, list]) => (
+                    React.createElement("div", { key: aisle, className:"rounded-2xl border p-3" },
+                      React.createElement("div", { className:"flex items-center justify-between" },
+                        React.createElement("div", { className:"font-medium" }, "Aisle ", aisle),
+                        React.createElement("div", { className:"text-xs text-gray-500" }, "Suggested Tote ", toteForAisle(aisle))
+                      ),
+                      React.createElement("div", { className:"mt-2 grid gap-2" },
+                        list.map(it => (
+                          React.createElement("label", { key: it.id, className:"flex items-center gap-2" },
+                            React.createElement("input", { type:"checkbox", checked:!!it.done, onChange:()=>updateItem(it.id, { done: !it.done }) }),
+                            React.createElement("span", { className:"truncate text-sm" }, it.title)
+                          )
+                        ))
+                      )
+                    )
+                  ))
+                )
+              ),
+              error && React.createElement("div", { className:"mt-4 text-sm text-red-700" }, String(error)),
+              busy && React.createElement("div", { className:"mt-2 text-sm text-gray-500" }, "Looking up item…"),
+              React.createElement("div", { className:"h-20" })
+            ),
+
+            React.createElement("nav", { className:"fixed bottom-0 inset-x-0 bg-white border-t" },
+              React.createElement("div", { className:"max-w-screen-sm mx-auto px-3 py-2 grid grid-cols-3 gap-2" },
+                React.createElement("button", { onClick:()=>setScanning(true), className:"px-3 py-2 rounded-xl bg-black text-white flex items-center justify-center gap-2" },
+                  React.createElement(QrCode, { className:"w-4 h-4" }), "Scan"
+                ),
+                React.createElement("button", { onClick:()=>window.scrollTo({ top: 0, behavior: 'smooth' }), className:"px-3 py-2 rounded-xl border flex items-center justify-center gap-2" },
+                  React.createElement(RefreshCw, { className:"w-4 h-4" }), "Top"
+                ),
+                React.createElement("button", { onClick:()=>reassignAll(), className:"px-3 py-2 rounded-xl border flex items-center justify-center gap-2" },
+                  React.createElement(Wrench, { className:"w-4 h-4" }), "Reassign"
+                )
+              )
+            ),
+
+            React.createElement("dialog", { open: settingsOpen, className:"rounded-2xl p-0 w-[92%] max-w-sm" },
+              React.createElement("div", { className:"p-4 border-b font-semibold flex items-center gap-2" },
+                React.createElement(SlidersHorizontal, { className:"w-4 h-4" }), "Settings"
+              ),
+              React.createElement("div", { className:"p-4 grid gap-3 text-sm" },
+                React.createElement("div", { className:"grid grid-cols-2 gap-3 items-center" },
+                  React.createElement("label", null, "Number of totes"),
+                  React.createElement("select", {
+                    value: numTotes,
+                    onChange:(e)=> setNumTotes(clamp(Number(e.target.value)||8, 5, 8)),
+                    className:"px-2 py-1 rounded-xl border"
+                  },
+                    [5,6,7,8].map(n => React.createElement("option", { key:n, value:n }, `${n}`))
+                  )
+                ),
+                React.createElement("div", { className:"grid grid-cols-2 gap-3 items-center" },
+                  React.createElement("label", null, "Tote capacity (units)"),
+                  React.createElement("input", {
+                    type:"number", min:5, max:200, value: toteCapacity,
+                    onChange:(e)=> setToteCapacity(clamp(Number(e.target.value)||20, 5, 200)),
+                    className:"px-2 py-1 rounded-xl border"
+                  })
+                ),
+                React.createElement("p", { className:"text-xs text-gray-600" },
+                  "Size units: S=1, M=2, L=3, XL=5. The load per tote is the sum of item units; if full, items will be assigned to the next tote with space."
+                )
+              ),
+              React.createElement("div", { className:"p-3 border-t flex justify-end gap-2" },
+                React.createElement("button", { onClick:()=>setSettingsOpen(false), className:"px-3 py-1 rounded-xl border" }, "Close")
+              )
+            )
+          )
+        );
+      }
+      createRoot(document.getElementById("root")).render(React.createElement(App));
+    </script>
+  </body>
+</html>
